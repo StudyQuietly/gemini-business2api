@@ -88,44 +88,68 @@ stats_lock = asyncio.Lock()  # 改为异步锁
 
 async def load_stats():
     """加载统计数据（异步）。"""
+    data = None
     if storage.is_database_enabled():
         try:
             data = await asyncio.to_thread(storage.load_stats_sync)
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict):
+                data = None
         except Exception as e:
             logger.error(f"[STATS] 数据库加载失败: {str(e)[:50]}")
-    try:
-        if os.path.exists(STATS_FILE):
-            async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                return json.loads(content)
-    except Exception:
-        pass
-    return {
-        "total_visitors": 0,
-        "total_requests": 0,
-        "request_timestamps": [],
-        "model_request_timestamps": {},
-        "failure_timestamps": [],
-        "rate_limit_timestamps": [],
-        "visitor_ips": {},
-        "account_conversations": {},
-        "recent_conversations": []
-    }
+    if data is None:
+        try:
+            if os.path.exists(STATS_FILE):
+                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    data = json.loads(content)
+        except Exception:
+            pass
+
+    # 如果没有加载到数据，返回默认值
+    if data is None:
+        data = {
+            "total_visitors": 0,
+            "total_requests": 0,
+            "request_timestamps": [],
+            "model_request_timestamps": {},
+            "failure_timestamps": [],
+            "rate_limit_timestamps": [],
+            "visitor_ips": {},
+            "account_conversations": {},
+            "recent_conversations": []
+        }
+
+    # 将列表转换为 deque（限制大小防止内存无限增长）
+    if isinstance(data.get("request_timestamps"), list):
+        data["request_timestamps"] = deque(data["request_timestamps"], maxlen=20000)
+    if isinstance(data.get("failure_timestamps"), list):
+        data["failure_timestamps"] = deque(data["failure_timestamps"], maxlen=10000)
+    if isinstance(data.get("rate_limit_timestamps"), list):
+        data["rate_limit_timestamps"] = deque(data["rate_limit_timestamps"], maxlen=10000)
+
+    return data
 
 async def save_stats(stats):
     """保存统计数据（异步，避免阻塞事件循环）"""
+    # 将 deque 转换为 list 以便 JSON 序列化
+    stats_to_save = stats.copy()
+    if isinstance(stats_to_save.get("request_timestamps"), deque):
+        stats_to_save["request_timestamps"] = list(stats_to_save["request_timestamps"])
+    if isinstance(stats_to_save.get("failure_timestamps"), deque):
+        stats_to_save["failure_timestamps"] = list(stats_to_save["failure_timestamps"])
+    if isinstance(stats_to_save.get("rate_limit_timestamps"), deque):
+        stats_to_save["rate_limit_timestamps"] = list(stats_to_save["rate_limit_timestamps"])
+
     if storage.is_database_enabled():
         try:
-            saved = await asyncio.to_thread(storage.save_stats_sync, stats)
+            saved = await asyncio.to_thread(storage.save_stats_sync, stats_to_save)
             if saved:
                 return
         except Exception as e:
             logger.error(f"[STATS] 数据库保存失败: {str(e)[:50]}")
     try:
         async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(stats, ensure_ascii=False, indent=2))
+            await f.write(json.dumps(stats_to_save, ensure_ascii=False, indent=2))
     except Exception as e:
         logger.error(f"[STATS] 保存统计数据失败: {str(e)[:50]}")
 
@@ -133,10 +157,10 @@ async def save_stats(stats):
 global_stats = {
     "total_visitors": 0,
     "total_requests": 0,
-    "request_timestamps": [],
+    "request_timestamps": deque(maxlen=20000),
     "model_request_timestamps": {},
-    "failure_timestamps": [],
-    "rate_limit_timestamps": [],
+    "failure_timestamps": deque(maxlen=10000),
+    "rate_limit_timestamps": deque(maxlen=10000),
     "visitor_ips": {},
     "account_conversations": {},
     "recent_conversations": []
@@ -934,22 +958,21 @@ async def admin_stats(request: Request):
         return buckets
 
     async with stats_lock:
-        global_stats.setdefault("request_timestamps", [])
-        global_stats.setdefault("failure_timestamps", [])
-        global_stats.setdefault("rate_limit_timestamps", [])
+        global_stats.setdefault("request_timestamps", deque(maxlen=20000))
+        global_stats.setdefault("failure_timestamps", deque(maxlen=10000))
+        global_stats.setdefault("rate_limit_timestamps", deque(maxlen=10000))
         global_stats.setdefault("model_request_timestamps", {})
-        global_stats["request_timestamps"] = [
-            ts for ts in global_stats["request_timestamps"]
-            if now - ts < window_seconds
-        ]
-        global_stats["failure_timestamps"] = [
-            ts for ts in global_stats["failure_timestamps"]
-            if now - ts < window_seconds
-        ]
-        global_stats["rate_limit_timestamps"] = [
-            ts for ts in global_stats["rate_limit_timestamps"]
-            if now - ts < window_seconds
-        ]
+
+        # 清理过期数据，保持 deque 类型
+        cleaned_request_ts = [ts for ts in global_stats["request_timestamps"] if now - ts < window_seconds]
+        global_stats["request_timestamps"] = deque(cleaned_request_ts, maxlen=20000)
+
+        cleaned_failure_ts = [ts for ts in global_stats["failure_timestamps"] if now - ts < window_seconds]
+        global_stats["failure_timestamps"] = deque(cleaned_failure_ts, maxlen=10000)
+
+        cleaned_rate_limit_ts = [ts for ts in global_stats["rate_limit_timestamps"] if now - ts < window_seconds]
+        global_stats["rate_limit_timestamps"] = deque(cleaned_rate_limit_ts, maxlen=10000)
+
         model_request_timestamps = {}
         for model, timestamps in global_stats["model_request_timestamps"].items():
             model_request_timestamps[model] = [
